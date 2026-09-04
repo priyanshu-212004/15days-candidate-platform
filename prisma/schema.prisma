@@ -1,0 +1,933 @@
+// 15days.io — database schema
+// PostgreSQL + Prisma. UUID primary keys, timestamps, soft delete where appropriate,
+// indexes chosen for the query patterns in the recruiter dashboard, candidate table,
+// and pipeline board.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & tenancy
+// ---------------------------------------------------------------------------
+
+enum OrgRole {
+  OWNER
+  ADMIN
+  RECRUITER
+  VIEWER
+}
+
+// Candidate platform (Phase 2): distinguishes a platform-level recruiter
+// account (existing, org-scoped via OrganizationMember) from a platform-level
+// candidate account (new, org-independent via CandidateProfile). Defaults to
+// RECRUITER so every existing User row is valid with no backfill required —
+// this column is purely additive.
+enum UserType {
+  RECRUITER
+  CANDIDATE
+}
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  name          String
+  passwordHash  String?
+  image         String?
+  emailVerified DateTime?
+  mfaEnabled    Boolean   @default(false)
+  mfaSecret     String?
+  // Phase 2: RECRUITER (default, existing behavior) or CANDIDATE. Recruiter
+  // authentication/authorization (OrganizationMember-based) is untouched;
+  // this only gates the new candidate-only relations below.
+  userType      UserType  @default(RECRUITER)
+
+  memberships  OrganizationMember[]
+  auditLogs    AuditLog[]
+  notes        CandidateNote[]
+  comments     CandidateComment[]
+  stageChanges CandidateStageHistory[]
+  notifications Notification[]
+  // Phase 2: present only for userType = CANDIDATE. 1:1, mirrors the
+  // Resume/ResumeEvaluation "optional back-relation" pattern already used
+  // elsewhere in this schema.
+  candidateProfile CandidateProfile?
+  // Phase 2: org-scoped recruiter-side Candidate rows this account has been
+  // linked to (see Candidate.userId below) — a candidate can be linked to at
+  // most one Candidate row per organization, but potentially many across
+  // organizations, which is exactly what makes the marketplace "apply to
+  // many orgs with one account" work without changing Candidate's shape.
+  linkedCandidateRecords Candidate[] @relation("CandidateAccountLink")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+}
+
+model Organization {
+  id       String  @id @default(uuid())
+  name     String
+  slug     String  @unique
+  logoUrl  String?
+  timezone String  @default("UTC")
+  locale   String  @default("en")
+
+  members      OrganizationMember[]
+  jobs         Job[]
+  candidates   Candidate[]
+  interviews   Interview[]
+  pipelineStages PipelineStage[]
+  auditLogs    AuditLog[]
+  integrations Integration[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  @@index([slug])
+}
+
+model OrganizationMember {
+  id     String  @id @default(uuid())
+  userId String
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orgId  String
+  org    Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  role   OrgRole @default(RECRUITER)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, orgId])
+  @@index([orgId])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid())
+  email     String
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([email])
+}
+
+// ---------------------------------------------------------------------------
+// Jobs & interviews
+// ---------------------------------------------------------------------------
+
+enum JobStatus {
+  DRAFT
+  OPEN
+  PAUSED
+  ARCHIVED
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERNSHIP
+}
+
+model Job {
+  id          String         @id @default(uuid())
+  orgId       String
+  org         Organization   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  title       String
+  description String
+  requirements String[]
+  skills      String[]
+  experienceLevel String?
+  location    String?
+  remote      Boolean        @default(false)
+  employmentType EmploymentType @default(FULL_TIME)
+  status      JobStatus      @default(DRAFT)
+  createdById String
+
+  interviews   Interview[]
+  applications Application[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([orgId, status])
+}
+
+enum InterviewStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  EXPIRED
+}
+
+// Phase 6 (adaptive interviews): STATIC is the original behavior — a fixed
+// list of InterviewQuestion rows generated up front, answered one at a
+// time (recorded video or typed text), evaluated after submission. Every
+// interview created before this field existed defaults to STATIC and its
+// code path is untouched. ADAPTIVE_VOICE is new: no InterviewQuestion rows
+// are generated ahead of time — instead an InterviewBlueprint captures what
+// to evaluate, and questions are generated turn-by-turn during a live,
+// voice-driven InterviewSession. See InterviewBlueprint/InterviewSession/
+// InterviewTurn below.
+enum InterviewType {
+  STATIC
+  ADAPTIVE_VOICE
+}
+
+model Interview {
+  id           String   @id @default(uuid())
+  orgId        String
+  org          Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  jobId        String
+  job          Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  title        String
+  publicToken  String   @unique @default(uuid())
+  status       InterviewStatus @default(DRAFT)
+  expiresAt    DateTime?
+  maxAttempts  Int      @default(1)
+  languages    String[] @default(["en"])
+  requireCv    Boolean  @default(true)
+  createdById  String
+  interviewType InterviewType @default(STATIC)
+
+  questions    InterviewQuestion[]
+  applications Application[]
+  blueprint    InterviewBlueprint?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orgId, status])
+  @@index([publicToken])
+}
+
+// Phase 6: what an ADAPTIVE_VOICE interview should evaluate, in place of a
+// fixed question list. One row per Interview (1:1, like Resume/
+// ResumeEvaluation) — HR edits weights/target levels before publishing;
+// the interview engine reads this at runtime instead of a question table.
+model InterviewBlueprint {
+  id          String    @id @default(uuid())
+  interviewId String    @unique
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  durationTargetMin    Int  @default(20)
+  durationMinMin       Int  @default(15)
+  durationMaxMin       Int  @default(22)
+  graceSeconds         Int  @default(60)
+  maxFollowUpsPerTopic Int  @default(2)
+  // [{ name: string, weight: number, targetLevel?: string }]
+  evaluationAreas      Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Phase 6: one live adaptive-voice interview attempt. 1:1 with Application,
+// mirroring how VideoResponse/Resume/Evaluation already hang off
+// Application for STATIC interviews — this is the ADAPTIVE_VOICE
+// counterpart of "the candidate's answers," just shaped as an evolving
+// conversation + evidence profile instead of fixed per-question rows.
+enum InterviewSessionStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+model InterviewSession {
+  id            String      @id @default(uuid())
+  applicationId String      @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  status         InterviewSessionStatus @default(IN_PROGRESS)
+  startedAt      DateTime  @default(now())
+  endedAt        DateTime?
+  endReason      String?
+
+  currentTopic     String?
+  topicsCovered    String[] @default([])
+  topicsRemaining  String[] @default([])
+  questionCount    Int      @default(0)
+  // { [topic: string]: number } — follow-ups asked per topic so far,
+  // enforced server-side against blueprint.maxFollowUpsPerTopic. The AI may
+  // *recommend* another follow-up; only this counter (checked in app code,
+  // not by the model) decides whether it's actually allowed.
+  followUpCountByTopic Json @default("{}")
+  // { [topic: string]: { score, confidence, evidence: string[] } } — updated
+  // after every answer, and what the final evaluation is computed from
+  // instead of re-sending the full transcript on every AI call.
+  candidateEvidence    Json @default("{}")
+
+  turns InterviewTurn[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Phase 6: one question/answer exchange in an adaptive session. Deliberately
+// separate from InterviewQuestion/VideoResponse — those model a fixed slot
+// in a predefined list; a turn is one step in an open-ended, variable-length
+// conversation with no predefined slot to attach to.
+model InterviewTurn {
+  id         String   @id @default(uuid())
+  sessionId  String
+  session    InterviewSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  turnNumber Int
+  topic      String?
+  question   String
+  action     String   // FOLLOW_UP | NEW_TOPIC | CLARIFICATION | END_INTERVIEW
+  difficulty String?
+  askedAt    DateTime @default(now())
+
+  answerText String?
+  answeredAt DateTime?
+
+  // Video recording of the candidate's spoken answer for this turn — the
+  // adaptive counterpart of VideoResponse.storageKey. Kept directly on
+  // InterviewTurn (rather than reusing VideoResponse, which has a NOT NULL
+  // FK to InterviewQuestion that adaptive turns don't have) since each turn
+  // already represents exactly one question/answer exchange, 1:1, so no
+  // separate join table is needed. videoTranscript is filled in
+  // asynchronously after upload as a durable, re-derivable backup of the
+  // live browser-STT transcript in answerText — never blocks the live
+  // adaptive loop, which always proceeds on the browser transcript.
+  videoStorageKey        String?
+  videoMimeType          String?
+  videoDurationSec       Int?
+  videoTranscript        String?
+  videoTranscriptStatus  JobQueueStatus @default(PENDING)
+
+  @@index([sessionId, turnNumber])
+}
+
+// Phase 6: lightweight cost/usage tracking for every AI call across the
+// app (question generation, adaptive turns, evaluation, resume evaluation)
+// so "average AI cost/calls/tokens per interview" (see README/task spec)
+// can actually be computed. No existing tracking to extend — this is new.
+model AiUsageLog {
+  id               String   @id @default(uuid())
+  provider         String
+  model            String
+  purpose          String   // QUESTION_GEN | ADAPTIVE_TURN | ADAPTIVE_EVALUATION | ANSWER_EVALUATION | RESUME_EVALUATION
+  interviewId      String?
+  applicationId    String?
+  inputTokens      Int      @default(0)
+  outputTokens     Int      @default(0)
+  estimatedCostUsd Float?
+  succeeded        Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+
+  @@index([applicationId])
+  @@index([interviewId, createdAt])
+  @@index([purpose, createdAt])
+}
+
+enum QuestionType {
+  BEHAVIORAL
+  TECHNICAL
+  SITUATIONAL
+  CULTURE_FIT
+}
+
+enum QuestionDifficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+model InterviewQuestion {
+  id                 String             @id @default(uuid())
+  interviewId        String
+  interview          Interview          @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  text               String
+  type               QuestionType       @default(BEHAVIORAL)
+  category           String?
+  difficulty         QuestionDifficulty @default(MEDIUM)
+  expectedDurationSec Int               @default(120)
+  evaluationCriteria String[]
+  order              Int
+  aiGenerated        Boolean            @default(true)
+  // Phase 5: the recruiter — never the candidate — decides how each
+  // question must be answered. Enforced server-side in the candidate
+  // answer/recording routes; the candidate UI only ever shows the matching
+  // input. Defaults to VIDEO so existing questions (recorded before this
+  // field existed) keep behaving exactly as they did.
+  answerType         AnswerType         @default(VIDEO)
+
+  videoResponses VideoResponse[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([interviewId, order])
+}
+
+// ---------------------------------------------------------------------------
+// Candidates & applications
+// ---------------------------------------------------------------------------
+
+model Candidate {
+  id       String  @id @default(uuid())
+  orgId    String
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  email    String
+  name     String
+  phone    String?
+  location String?
+  preferredLanguage String @default("en")
+  // Phase 2: nullable link to a platform candidate account (User.userType =
+  // CANDIDATE), set when that candidate applies to this org and either (a)
+  // this row already existed from recruiter-side data entry and gets
+  // claimed, or (b) this row is created fresh by the application flow. Left
+  // null for the many existing/legacy Candidate rows that were never
+  // created through the candidate platform — those continue to work exactly
+  // as before. This is the ONLY change to this model: orgId, the
+  // @@unique([orgId, email]) constraint, and every existing recruiter query
+  // against it are untouched.
+  userId   String?
+  user     User?   @relation("CandidateAccountLink", fields: [userId], references: [id])
+
+  applications Application[]
+  notes        CandidateNote[]
+  comments     CandidateComment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orgId, email])
+  @@index([orgId])
+  @@index([userId])
+}
+
+enum ApplicationStatus {
+  PENDING
+  IN_PROGRESS
+  SUBMITTED
+  EVALUATED
+}
+
+model Application {
+  id           String   @id @default(uuid())
+  orgId        String
+  candidateId  String
+  candidate    Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  jobId        String
+  job          Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  interviewId  String
+  interview    Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  status       ApplicationStatus @default(PENDING)
+  currentStageId String?
+  currentStage PipelineStage? @relation(fields: [currentStageId], references: [id])
+
+  resume        Resume?
+  videoResponses VideoResponse[]
+  evaluation    Evaluation?
+  stageHistory  CandidateStageHistory[]
+  flags         SuspiciousFlag[]
+  // Phase 6: only set for ADAPTIVE_VOICE interviews — null for STATIC ones.
+  interviewSession InterviewSession?
+
+  startedAt   DateTime?
+  submittedAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([orgId, jobId])
+  @@index([orgId, currentStageId])
+  @@index([candidateId])
+}
+
+model Resume {
+  id            String  @id @default(uuid())
+  applicationId String  @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  storageKey    String
+  fileName      String
+  mimeType      String
+  sizeBytes     Int
+  parsedText    String?
+  parseStatus   JobQueueStatus @default(PENDING)
+  // Phase 5: a human-readable reason when parseStatus = FAILED (e.g. a
+  // scanned/image-only PDF, an unsupported legacy .doc, a corrupted file).
+  // Never fabricated — only ever set from an actual extraction failure.
+  parseError    String?
+
+  resumeEvaluation ResumeEvaluation?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Phase 5: resume evaluation against a specific job. Kept as its own model
+// rather than folded into `Evaluation` because the two assess genuinely
+// different things with different shapes and different lifecycles —
+// `Evaluation` scores interview *answers* against ScoreCategory
+// (TECHNICAL/COMMUNICATION/CONFIDENCE/...) and only makes sense once an
+// application is SUBMITTED; a resume can be evaluated as soon as extraction
+// finishes, well before the candidate ever answers a question, and what's
+// being scored (skills/experience match against the job, missing skills,
+// a hire recommendation) doesn't map onto ScoreCategory at all. Reusing
+// `Evaluation` would mean either breaking its one-row-per-application
+// uniqueness or bolting an unrelated "kind" discriminator onto it — a new,
+// narrowly-scoped model mirroring `Evaluation`'s existing field-naming
+// conventions (modelName/modelVersion/promptVersion/status/strengths/
+// concerns/summary) is the smaller, less invasive change.
+model ResumeEvaluation {
+  id       String @id @default(uuid())
+  resumeId String @unique
+  resume   Resume @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+
+  overallScore      Float
+  skillsMatchScore  Float
+  experienceMatchScore Float
+  relevanceScore    Float
+  strengths         String[]
+  missingSkills     String[]
+  concerns          String[]
+  recommendation    String
+  summary           String
+  modelName         String
+  modelVersion      String
+  promptVersion     String
+  status            JobQueueStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Video responses, evaluation, anti-cheat
+// ---------------------------------------------------------------------------
+
+enum JobQueueStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum AnswerType {
+  TEXT
+  VIDEO
+}
+
+model VideoResponse {
+  id            String   @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  questionId    String
+  question      InterviewQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  // Phase 3: a per-question response can be answered as typed text
+  // (answerType = TEXT, storageKey null) or as an uploaded recording
+  // (answerType = VIDEO, storageKey set once upload is confirmed). This
+  // keeps a single row per (applicationId, questionId) regardless of which
+  // mode was used, rather than duplicating the "candidate's answer to this
+  // question" concept across two models — a candidate can only ever have
+  // one current answer per question, never both.
+  answerType       AnswerType @default(VIDEO)
+  answerText       String?
+  storageKey       String?
+  durationSec      Int?
+  transcript       String?
+  transcriptStatus JobQueueStatus @default(PENDING)
+
+  flags SuspiciousFlag[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([applicationId, questionId])
+  @@index([applicationId])
+}
+
+model SuspiciousFlag {
+  id              String   @id @default(uuid())
+  applicationId   String
+  application     Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  videoResponseId String?
+  videoResponse   VideoResponse? @relation(fields: [videoResponseId], references: [id], onDelete: Cascade)
+  type            String   // e.g. MULTIPLE_FACES, GAZE_AWAY, EXTRA_VOICE, AUDIO_ANOMALY
+  confidence      Float
+  detail          String?
+  reviewed        Boolean  @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([applicationId])
+}
+
+model Evaluation {
+  id            String   @id @default(uuid())
+  applicationId String   @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  overallScore  Float
+  summary       String
+  strengths     String[]
+  concerns      String[]
+  modelName     String
+  modelVersion  String
+  promptVersion String
+  status        JobQueueStatus @default(PENDING)
+
+  scores EvaluationScore[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([applicationId])
+  @@index([overallScore])
+}
+
+enum ScoreCategory {
+  TECHNICAL
+  COMMUNICATION
+  CONFIDENCE
+  ROLE_FIT
+  RELEVANCE
+  COMPLETENESS
+}
+
+model EvaluationScore {
+  id           String   @id @default(uuid())
+  evaluationId String
+  evaluation   Evaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+  category     ScoreCategory
+  score        Float
+  rationale    String?
+
+  @@unique([evaluationId, category])
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline / ATS
+// ---------------------------------------------------------------------------
+
+model PipelineStage {
+  id      String  @id @default(uuid())
+  orgId   String
+  org     Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  name    String
+  order   Int
+  isDefault Boolean @default(false)
+  color   String?
+
+  applications Application[]
+  history      CandidateStageHistory[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orgId, name])
+  @@index([orgId, order])
+}
+
+model CandidateStageHistory {
+  id            String   @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  stageId       String
+  stage         PipelineStage @relation(fields: [stageId], references: [id])
+  movedById     String?
+  movedBy       User?    @relation(fields: [movedById], references: [id])
+  note          String?
+
+  createdAt DateTime @default(now())
+
+  @@index([applicationId])
+  @@index([applicationId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Cross-cutting: notes, audit, notifications, integrations
+// ---------------------------------------------------------------------------
+
+model CandidateNote {
+  id          String   @id @default(uuid())
+  candidateId String
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  authorId    String
+  author      User     @relation(fields: [authorId], references: [id])
+  body        String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([candidateId])
+  @@index([candidateId, createdAt])
+}
+
+// Phase 5: internal recruiter-to-recruiter discussion on a candidate,
+// distinct from CandidateNote — notes are a recruiter's own observations,
+// comments are a threaded team conversation. Both are org-internal and
+// never exposed to candidates. Modeled the same way as CandidateNote
+// (author relation, cascade delete with the candidate, updatedAt for edits)
+// for consistency with the existing pattern.
+model CandidateComment {
+  id          String   @id @default(uuid())
+  candidateId String
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  authorId    String
+  author      User     @relation(fields: [authorId], references: [id])
+  body        String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([candidateId])
+  @@index([candidateId, createdAt])
+}
+
+model AuditLog {
+  id       String   @id @default(uuid())
+  orgId    String
+  org      Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  userId   String?
+  user     User?    @relation(fields: [userId], references: [id])
+  action   String
+  resourceType String
+  resourceId   String
+  metadata     Json?
+  ipAddress    String?
+
+  createdAt DateTime @default(now())
+
+  @@index([orgId, createdAt])
+  @@index([resourceType, resourceId])
+}
+
+model Notification {
+  id      String   @id @default(uuid())
+  userId  String
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type    String
+  title   String
+  body    String?
+  readAt  DateTime?
+  metadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt])
+}
+
+enum IntegrationProvider {
+  SLACK
+  GREENHOUSE
+  LEVER
+  WEBHOOK
+  CALENDAR
+}
+
+model Integration {
+  id           String   @id @default(uuid())
+  orgId        String
+  org          Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  provider     IntegrationProvider
+  config       Json
+  enabled      Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([orgId, provider])
+}
+
+// ---------------------------------------------------------------------------
+// Candidate platform (Phase 2)
+//
+// Everything below is new and purely additive — it introduces the global
+// candidate identity described in the implementation plan. Nothing above
+// this line is restructured: Candidate stays org-scoped with its existing
+// @@unique([orgId, email]), Application/Resume/Evaluation/pipeline models
+// are unchanged, and recruiter authorization is untouched. CandidateProfile
+// is the 1:1 global professional identity for a User with userType =
+// CANDIDATE; it is deliberately NOT related to Organization/Job directly —
+// it reaches jobs/orgs only through Application, exactly like today, via
+// the org-scoped Candidate row that Candidate.userId links it to.
+// ---------------------------------------------------------------------------
+
+enum WorkMode {
+  REMOTE
+  HYBRID
+  ON_SITE
+}
+
+model CandidateProfile {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Personal
+  phone    String?
+  location String?
+  photoUrl String?
+
+  // Professional
+  currentTitle         String?
+  currentCompany       String?
+  totalExperienceYears Float?
+  employmentStatus     String?
+  currentCtc           Float?
+  expectedCtc          Float?
+  ctcCurrency          String  @default("USD")
+  noticePeriodDays     Int?
+
+  // Preferences
+  preferredJobType   EmploymentType?
+  preferredWorkMode  WorkMode?
+  preferredLocations String[]        @default([])
+
+  // Skills/languages — kept as simple String[] per the approved plan; a
+  // richer per-skill model can be introduced later if it's ever actually
+  // needed, not speculatively now.
+  skills    String[] @default([])
+  languages String[] @default([])
+  // Simple, additive certification support — plain strings (e.g. "AWS
+  // Certified Solutions Architect, 2024"), not a separate relational model,
+  // per the approved plan to keep this additive and unforced.
+  certifications String[] @default([])
+
+  // Resume — reuses the existing storage + parsing pipeline (same
+  // storageKey/parseStatus/parseError shape as Resume below); this is the
+  // candidate's current/master resume. A submitted Application keeps its
+  // own immutable Resume row (per-application snapshot), so replacing the
+  // profile resume here never rewrites application history.
+  resumeStorageKey  String?
+  resumeFileName    String?
+  resumeMimeType    String?
+  resumeSizeBytes   Int?
+  resumeParsedText  String?
+  resumeParseStatus JobQueueStatus @default(PENDING)
+  resumeParseError  String?
+
+  experience     CandidateExperience[]
+  education      CandidateEducation[]
+  mockInterviews MockInterview[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model CandidateExperience {
+  id                 String            @id @default(uuid())
+  candidateProfileId String
+  candidateProfile   CandidateProfile  @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+
+  company     String
+  title       String
+  startDate   DateTime
+  endDate     DateTime?
+  isCurrent   Boolean   @default(false)
+  description String?
+  skills      String[]  @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([candidateProfileId])
+}
+
+model CandidateEducation {
+  id                 String            @id @default(uuid())
+  candidateProfileId String
+  candidateProfile   CandidateProfile  @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+
+  degree         String
+  institution    String
+  fieldOfStudy   String?
+  graduationYear Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([candidateProfileId])
+}
+
+enum MockInterviewType {
+  TECHNICAL
+  BEHAVIORAL
+  MIXED
+}
+
+enum MockInterviewDifficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum MockInterviewStatus {
+  IN_PROGRESS
+  COMPLETED
+  ABANDONED
+}
+
+// Deliberately isolated: no FK to Job, Application, or the org-scoped
+// Candidate model. A mock interview can never become or create a real
+// recruiter-visible application. It mirrors the *shape* of
+// InterviewSession/InterviewTurn (turn-by-turn Q&A + a final scored
+// summary) conceptually, since that pattern already exists and works well,
+// but does not reuse those models directly — InterviewSession.applicationId
+// is a required 1:1 FK to Application, and bending that to also mean
+// "or a mock interview" would be exactly the kind of risky change to
+// working recruiter code the plan rules out. Existing AI evaluation
+// utilities (ai-provider.ts / ai-evaluation.ts) are still reused at the
+// call-site level in Phase 8 — only the persistence model is separate.
+model MockInterview {
+  id                 String            @id @default(uuid())
+  candidateProfileId String
+  candidateProfile   CandidateProfile  @relation(fields: [candidateProfileId], references: [id], onDelete: Cascade)
+
+  role              String
+  experienceBand    String
+  type              MockInterviewType
+  difficulty        MockInterviewDifficulty
+  durationTargetMin Int
+
+  status    MockInterviewStatus @default(IN_PROGRESS)
+  startedAt DateTime            @default(now())
+  endedAt   DateTime?
+
+  turns MockInterviewTurn[]
+
+  overallScore          Float?
+  strengths             String[] @default([])
+  weaknesses             String[] @default([])
+  suggestedImprovements String[] @default([])
+  communicationFeedback String?
+  technicalFeedback     String?
+  summary               String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([candidateProfileId])
+}
+
+model MockInterviewTurn {
+  id              String        @id @default(uuid())
+  mockInterviewId String
+  mockInterview   MockInterview @relation(fields: [mockInterviewId], references: [id], onDelete: Cascade)
+
+  turnNumber Int
+  question   String
+  answerText String?
+  askedAt    DateTime  @default(now())
+  answeredAt DateTime?
+
+  @@index([mockInterviewId, turnNumber])
+}
